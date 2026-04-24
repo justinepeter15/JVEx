@@ -1,0 +1,117 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isAdmin() {
+      // For this app, we'll check if the user's email is verified and potentially in an admin list
+      // In a real app, use a dedicated collection or custom claims
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // --- User Validation ---
+    function isValidUser(data) {
+      return data.keys().hasAll(['email', 'isPremium', 'createdAt'])
+        && data.email is string && data.email.size() <= 256
+        && data.isPremium is bool
+        && data.createdAt == request.time;
+    }
+
+    // --- Resource Validation ---
+    function isValidResource(data) {
+      return data.keys().hasAll(['title', 'type', 'isPremium', 'fileUrl', 'createdAt'])
+        && data.title is string && data.title.size() <= 200
+        && data.type in ['exam', 'book', 'lesson_plan', 'other']
+        && data.isPremium is bool
+        && data.fileUrl is string && data.fileUrl.size() <= 1000
+        && (data.get('averageRating', 0) is number)
+        && (data.get('reviewCount', 0) is int)
+        && (data.get('downloadCount', 0) is int)
+        && data.createdAt == request.time;
+    }
+
+    // --- Review Validation ---
+    function isValidReview(data) {
+      return data.keys().hasAll(['userId', 'userName', 'rating', 'comment', 'createdAt'])
+        && isValidId(data.userId) && data.userId == request.auth.uid
+        && data.userName is string && data.userName.size() <= 100
+        && data.rating is int && data.rating >= 1 && data.rating <= 5
+        && data.comment is string && data.comment.size() <= 1000
+        && data.createdAt == request.time;
+    }
+
+    // --- Match Blocks ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().isPremium == false;
+      allow update: if (isOwner(userId) || isAdmin()) && (
+        // Allow user to update their own profile (except premium status)
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName']) && incoming().displayName is string)
+        ||
+        // Allow admin to update anything (including premium status)
+        isAdmin()
+        ||
+        // SPECIAL ACTION: Mock Subscription (for demo purposes)
+        // In a real app, this field is immutable to the user
+        (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['isPremium', 'subscriptionExpiresAt', 'lastPaymentRef']))
+      );
+    }
+
+    match /resources/{resourceId} {
+      allow list: if true;
+      allow get: if isSignedIn() && (
+        !existing().isPremium 
+        || (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isPremium == true)
+        || isAdmin()
+      );
+      allow create: if isAdmin() && isValidResource(incoming());
+      allow update: if (isAdmin() && isValidResource(incoming())) || (
+        // Action: Increment downloadCount
+        isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['downloadCount'])
+        ||
+        // Action: Update rating via review (Atomic Transaction)
+        isSignedIn() && incoming().diff(existing()).affectedKeys().hasOnly(['averageRating', 'reviewCount'])
+      );
+      allow delete: if isAdmin();
+
+      match /reviews/{reviewId} {
+        allow read: if true;
+        allow create: if isSignedIn() && isValidReview(incoming()) && (
+          // Ensure user has profile or subscription to Review
+          exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        );
+      }
+    }
+
+    // Allow admins collection management
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if false; // Managed manually or via console
+    }
+  }
+}
